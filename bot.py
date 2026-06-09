@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 from gpt import ChatGptService
@@ -31,6 +31,29 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Глобальний словник для збереження активних ігор користувачів: {chat_id: об'єкт_гри}
 user_games = {}
 
+
+def can_beat_card(attack_card, defend_card, trump_suit) -> bool:
+    """Твоя фірмова логіка відбиття з урахуванням Джокерів та Козирів"""
+    # 1. Якщо карта захисту — Супер-Джокер
+    if defend_card.is_super_trump(trump_suit):
+        return True
+    # 2. Якщо карта атаки — Супер-Джокер, її побити не можна
+    if attack_card.is_super_trump(trump_suit):
+        return False
+    # 3. Якщо захищаємося звичайним Джокером (він некозирний і нічого не б'є)
+    if defend_card.is_joker():
+        return False
+    # 4. Якщо нас атакують звичайним Джокером (він некозирний)
+    if attack_card.is_joker():
+        # Звичайного Джокера можна побити будь-яким козирем
+        return defend_card.suit == trump_suit
+    # 5. Класичні правила для звичайних карт
+    if attack_card.suit == defend_card.suit:
+        return defend_card.rank_val > attack_card.rank_val
+    # Якщо масті різні, побити можна тільки козирем
+    return defend_card.suit == trump_suit
+
+
 # 3. Хендлер команди /start
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -48,11 +71,16 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         deck_options
     )
 # Функція-конвертер карт гравця у словник для кнопок
-def get_player_cards_dict(player_hand) -> dict:
+def get_player_cards_dict(player_hand, role: str) -> dict:
     cards_buttons = {}
+    # Заповнюємо карти
     for index, card in enumerate(player_hand):
-        # Технічний ключ для хендлера (наприклад, "move_0") та красивий текст карти для екрана
         cards_buttons[f"move_{index}"] = f"{card.rank}{card.suit}"
+    # Додаємо спец-кнопку в самий кінець словника!
+    if role == "defend":
+        cards_buttons["action_take"] = "🥵 Забрати карти"
+    elif role == "attack":
+        cards_buttons["action_bito"] = "✅ Бито (Пас)"
     return cards_buttons
 
 # Хендлер, який ловить кліки по кнопках вибору колоди
@@ -81,14 +109,32 @@ async def select_deck_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     trump_suit = trump_card.suit
     # Сортуємо руку за допомогою алгоритму сортування з вагами!
     player.sort_hand(trump_suit)
-    # 3. ЗБЕРІГАЄМО СТАН ГРИ У СЕЙФ
-    # Записуємо всі об'єкти в наш глобальний словник, щоб гра не губилася між повідомленнями!
+    # Визначаємо випадково, хто ходить першим (як у твоїй грі!)
+    from random import choice as rand_choice
+    attacker = rand_choice(["player", "bot"])
+    # ЗБЕРІГАЄМО СТАН ГРИ У СЕЙФ (додали змінну attacker)
     user_games[chat_id] = {
         "deck": deck,
         "player": player,
         "bot": bot_player,
-        "trump_suit": trump_suit
+        "trump_suit": trump_suit,
+        "attacker": attacker,  # Хто зараз атакує
+        "table": []  # Карти, які зараз лежать на столі
     }
+    # Показуємо інформацію про гру
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🃏 Гра почалася! Козир: {trump_suit}\n"
+             f"👉 Першим ходить: {'ТИ' if attacker == 'player' else '🤖 БОТ'}"
+    )
+    # ЯКЩО ПЕРШИМ ХОДИТЬ БОТ — запускаємо його атаку одразу!
+    if attacker == "bot":
+        await bot_attack_logic(update, context, chat_id)
+    else:
+        # Якщо ходиш ти — виводимо твої карти
+        player_buttons = get_player_cards_dict(player.hand, role="attack")
+        await send_grid_buttons(update, context, "Твої карти для ходу:", player_buttons, row_width=3)
+
     # 4. ВИВОДИМО РЕЗУЛЬТАТ В БОТА
     # Показуємо інформацію про гру
     await context.bot.send_message(
@@ -97,7 +143,7 @@ async def select_deck_callback(update: Update, context: ContextTypes.DEFAULT_TYP
              f"У колоді залишилось карт: {len(deck.cards)}"
     )
     # Генеруємо словник кнопок для карт
-    player_buttons = get_player_cards_dict(player.hand)
+    player_buttons = get_player_cards_dict(player.hand, role="attack")
     # Виводимо карти красивою, компактною сіткою по 4 штуки в ряд!
     await send_grid_buttons(
         update,
@@ -106,6 +152,109 @@ async def select_deck_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         player_buttons,
         row_width=3
     )
+async def bot_attack_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    game_data = user_games[chat_id]
+    bot_player = game_data["bot"]
+    trump_suit = game_data["trump_suit"]
+    player = game_data["player"]
+    # Бот шукає найкращу карту для атаки з твого алгоритму min!
+    bot_card = bot_player.get_best_attack_card(trump_suit)
+    if bot_card:
+        bot_player.hand.remove(bot_card)
+        game_data["table"].append(bot_card)  # Кладемо карту на стіл
+        # Бот походив, тепер черга Дениса ВІДБИВАТИСЯ!
+        player_buttons = get_player_cards_dict(player.hand, role="defend")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚔️ Бот атакує тебе картою: {bot_card.rank}{bot_card.suit}\nВибери карту з рук, щоб ПОБИТИ її:"
+        )
+        await send_grid_buttons(update, context, "Чим будеш битися?", player_buttons, row_width=3, edit=True)
+    else:
+        # Якщо у бота раптом немає карт — кінець
+        await context.bot.send_message(chat_id=chat_id, text="🏳️ У бота закінчилися карти!")
+
+
+async def player_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    chat_id = update.effective_chat.id
+    query_data = update.callback_query.data
+
+    if chat_id not in user_games:
+        return
+
+    game_data = user_games[chat_id]
+    player = game_data["player"]
+    bot_player = game_data["bot"]
+    deck = game_data["deck"]
+    trump_suit = game_data["trump_suit"]
+    attacker = game_data["attacker"]
+
+    card_index = int(query_data.split("_")[1])
+    if card_index >= len(player.hand):
+        return
+
+    # === СЦЕНАРІЙ 1: ДЕНИС АТАКУЄ (Бот має відбитися) ===
+    if attacker == "player":
+        player_card = player.hand.pop(card_index)
+        # Шукаємо, чим бот може побити твою карту
+        suitable_defend_cards = [c for c in bot_player.hand if can_beat_card(player_card, c, trump_suit)]
+        if suitable_defend_cards:
+            best_defend_card = min(suitable_defend_cards, key=lambda card: card.rank_val)
+            bot_player.hand.remove(best_defend_card)
+
+            # ХІД ПЕРЕХОДИТЬ ДО БОТА!
+            game_data["attacker"] = "bot"
+            # Добір карт (Твій фірмовий цикл)
+            while len(deck.cards) > 0 and len(player.hand) < 6: player.take_card(deck.pop_card())
+            while len(deck.cards) > 0 and len(bot_player.hand) < 6: bot_player.take_card(deck.pop_card())
+            player.sort_hand(trump_suit)
+            # Запускаємо атаку бота
+            await bot_attack_logic(update, context, chat_id)
+        else:
+            # Бот не зміг відбитися і забирає карту!
+            bot_player.take_card(player_card)
+            # Замість send_message ми беремо існуючий update і примусово міняємо текст всередині кнопки!
+            await update.callback_query.edit_message_text(
+                text=f"⚔️ Твій хід прийнято!\n🃏 Карт у колоді: {len(deck.cards)}",
+                reply_markup=InlineKeyboardMarkup(keyboard)  # Передаємо нову сітку карт прямо сюди!
+            )
+            # Хід залишається у Дениса. Добираємо карти і виводимо нові кнопки
+            while len(deck.cards) > 0 and len(player.hand) < 6: player.take_card(deck.pop_card())
+            player.sort_hand(trump_suit)
+            player_buttons = get_player_cards_dict(player.hand, role="attack")
+            await send_grid_buttons(update, context, "Твої карти для наступного ходу:", player_buttons, row_width=3, edit=True)
+    # === СЦЕНАРІЙ 2: ДЕНИС ВІДБИВАЄТЬСЯ ВІД БОТА ===
+    elif attacker == "bot":
+        bot_attack_card = game_data["table"][-1]  # Остання карта бота на столі
+        player_card = player.hand[card_index]  # Карта, якою Денис хоче побити
+        # Перевіряємо за твоїми правилами, чи може Денис побити карту бота
+        if can_beat_card(bot_attack_card, player_card, trump_suit):
+            player.hand.pop(card_index)  # Прибираємо карту з руки, бо хід валідний
+            game_data["table"].pop()  # Прибираємо карту бота зі столу
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🛡️ Ти успішно побив {bot_attack_card} своєю {player_card}!\n\nБИТО! Тепер ТВОЯ черга атакувати бота ⚔️"
+            )
+            # ХІД ПЕРЕХОДИТЬ ДО ДЕНИСА!
+            game_data["attacker"] = "player"
+            # Добір карт
+            while len(deck.cards) > 0 and len(player.hand) < 6: player.take_card(deck.pop_card())
+            while len(deck.cards) > 0 and len(bot_player.hand) < 6: bot_player.take_card(deck.pop_card())
+            player.sort_hand(trump_suit)
+            # Виводимо карти Дениса для його власної атаки
+            player_buttons = get_player_cards_dict(player.hand, role="attack")
+            await send_grid_buttons(update, context, "Твої карти для атаки на бота:", player_buttons, row_width=3)
+        else:
+            # Якщо користувач вибрав карту, яка не б'є за правилами
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Твоя {player_card} не може побити {bot_attack_card}! Вибери іншу карту або візьми (цю логіку допишемо)."
+            )
+
+
+chat_gpt = ChatGptService('CHATGPT_TOKEN')
+app = ApplicationBuilder().token('BOT_TOKEN').build()
+
 # 4. Двигун запуску бота (в самому низу файлу bot.py)
 if __name__ == "__main__":
     print("Бот-Дурак з ШІ запускається...")
@@ -113,13 +262,9 @@ if __name__ == "__main__":
     # Реєструємо команду /start
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CallbackQueryHandler(select_deck_callback, pattern="^setup_"))
+    app.add_handler(CallbackQueryHandler(player_card_callback, pattern="^move_"))
     print("Бот успішно злетів! Перевіряй на Poco.")
     app.run_polling()
-
-
-
-chat_gpt = ChatGptService('CHATGPT_TOKEN')
-app = ApplicationBuilder().token('BOT_TOKEN').build()
 
                 # Зареєструвати обробник команди можна так:
                 # app.add_handler(CommandHandler('command', handler_func))

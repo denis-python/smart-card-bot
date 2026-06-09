@@ -114,5 +114,26 @@ async def default_callback_handler(update: Update,
     query = update.callback_query.data
     await send_html(update, context, f'You have pressed button with {query} callback')
 
+
+async def send_grid_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            text: str, buttons: dict, row_width: int = 3, edit: bool = False) -> Message:
+    text = text.encode('utf16', errors='surrogatepass').decode('utf16')
+    keyboard = []  # ОСЬ ВІН — НАШ СПИСОК КЛАВІАТУРИ, ЯКИЙ ЗГУБИВСЯ!
+    current_row = []  # Тимчасова кишеня для одного рядка
+    for key, value in buttons.items():
+        button = InlineKeyboardButton(str(value), callback_data=str(key))
+        current_row.append(button)
+        if len(current_row) == row_width:
+            keyboard.append(current_row)
+            current_row = []
+    if current_row:
+        keyboard.append(current_row)
+    reply_markup = InlineKeyboardMarkup(keyboard)  # Тепер Python чітко бачить цей список!
+    if edit:
+        return await update.callback_query.edit_message_text(text=text, reply_markup=reply_markup)
+    else:
+        return await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup)
+
+
 class Dialog:
     pass
